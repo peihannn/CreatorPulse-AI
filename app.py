@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from metrics import EVENT_COLUMNS, summarize_event_log
+
 
 st.set_page_config(page_title="Social Loop Studio", page_icon="🔁", layout="wide")
 
@@ -102,56 +104,6 @@ duration_segments = pd.DataFrame(
     [("≤20 sec", 65_000, 54_000, 14_000, 6_900), ("21–40 sec", 72_000, 58_500, 14_000, 6_500), (">40 sec", 38_000, 29_100, 6_537, 2_650)],
     columns=["Video duration", "Sends", "Opens", "Replies ≤24h", "2+ exchanges ≤24h"],
 )
-
-EVENT_COLUMNS = [
-    "event_name", "event_ts", "impression_id", "view_id", "share_id",
-    "share_recipient_id", "destination_type", "video_duration_sec",
-    "country", "language", "experiment_id", "variant",
-]
-
-
-def summarize_event_log(events: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
-    """Summarize an uploaded event log with explicit IDs and attribution windows."""
-    missing = [column for column in EVENT_COLUMNS if column not in events.columns]
-    if missing:
-        return pd.DataFrame(), "Missing required columns: " + ", ".join(missing)
-    frame = events.copy()
-    frame["event_ts"] = pd.to_datetime(frame["event_ts"], errors="coerce", utc=True)
-    if frame["event_ts"].isna().any():
-        return pd.DataFrame(), "Some event_ts values could not be parsed as dates/times."
-    allowed = {
-        "eligible_impression", "share_sheet_open", "share_sent", "recipient_open",
-        "recipient_reply", "conversation_2plus",
-    }
-    unknown = sorted(set(frame["event_name"].dropna().astype(str)) - allowed)
-    if unknown:
-        return pd.DataFrame(), "Unknown event_name value(s): " + ", ".join(unknown)
-    counts = []
-    id_by_event = {
-        "eligible_impression": "impression_id",
-        "share_sheet_open": "view_id",
-        "share_sent": "share_recipient_id",
-        "recipient_open": "share_recipient_id",
-        "recipient_reply": "share_recipient_id",
-        "conversation_2plus": "share_recipient_id",
-    }
-    for name, id_column in id_by_event.items():
-        subset = frame.loc[frame["event_name"] == name, id_column].dropna()
-        counts.append((name, subset.nunique()))
-    counts_df = pd.DataFrame(counts, columns=["event_name", "count"])
-    opens = frame.loc[frame["event_name"] == "recipient_open"].dropna(subset=["share_recipient_id"])
-    first_open = opens.groupby("share_recipient_id")["event_ts"].min()
-    replies = frame.loc[frame["event_name"] == "recipient_reply"].dropna(subset=["share_recipient_id"])
-    replies = replies.join(first_open.rename("first_open"), on="share_recipient_id")
-    timely_reply_ids = replies.loc[
-        (replies["event_ts"] >= replies["first_open"])
-        & (replies["event_ts"] <= replies["first_open"] + pd.Timedelta(hours=24)),
-        "share_recipient_id",
-    ].nunique()
-    result = {row.event_name: int(row.count) for row in counts_df.itertuples(index=False)}
-    result["recipient_reply_24h"] = int(timely_reply_ids)
-    return pd.DataFrame([result]), None
-
 
 EVENT_CSV_TEMPLATE = """event_name,event_ts,impression_id,view_id,share_id,share_recipient_id,destination_type,video_duration_sec,country,language,experiment_id,variant
 eligible_impression,2025-05-01T12:00:00Z,imp_1,,,,,18,US,en,reply_prompt_v1,control
@@ -364,7 +316,7 @@ elif page == "Data explorer":
         else:
             uploaded = st.file_uploader("Input · Select event CSV", type=["csv"], key="event_upload")
             st.download_button("Download CSV schema example", EVENT_CSV_TEMPLATE, "social_loop_event_schema.csv", "text/csv")
-            st.caption("Required columns are defined in the schema example. One row = one event; share_sent is recorded once per recipient, and share_id links recipients from the same send action.")
+            st.caption("Required columns are defined in the schema example. One row = one event; share_sent is recorded once per recipient, and share_id links recipients from the same send action. Include follow-up events through 7 days after the final send date so open attribution is complete.")
             if uploaded is not None:
                 try:
                     raw_events = pd.read_csv(uploaded)
@@ -467,16 +419,16 @@ elif page == "Data explorer":
     with st.expander("Metric definitions & minimum event schema"):
         definitions = pd.DataFrame(
             [
-                ("Share-sheet open rate", "Unique view_id with share_sheet_open ÷ eligible impression_id", "Same viewing session"),
-                ("Recipient open rate", "share_recipient_id opened ÷ delivered share_recipient_id", "Within 7 days of send"),
-                ("Open → reply", "Opened share_recipient_id with ≥1 recipient_reply ÷ opened share_recipient_id", "Within 24h of first open"),
-                ("2+ exchanges", "Opened share_recipient_id with ≥2 exchanges ÷ opened share_recipient_id", "Within 24h of first open"),
+                ("Share-sheet open rate", "Unique view_id values with share_sheet_open ÷ unique eligible impression_id values", "Selected event-date range; IDs are counted once"),
+                ("Recipient open rate", "Delivered share_recipient_id values with a valid open ÷ delivered share_recipient_id values", "Open must occur from send through 7 days after send"),
+                ("Open → reply", "Valid opened share_recipient_id values with ≥1 recipient_reply ÷ valid opened share_recipient_id values", "Reply must occur within 24h after first valid open"),
+                ("2+ exchanges", "Valid opened share_recipient_id values with a conversation_2plus event ÷ valid opened share_recipient_id values", "Milestone must occur within 24h after first valid open"),
             ], columns=["Metric", "Formula / counting unit", "Attribution window"],
         )
         st.dataframe(definitions, hide_index=True, width="stretch")
         schema = pd.DataFrame(
             [
-                ("event_id, event_name, event_ts", "Deduplication, event definition, time ordering"),
+                ("event_name, event_ts", "Event definition, attribution window, time ordering"),
                 ("impression_id, video_id, session_id", "Eligible view and content context"),
                 ("share_id, share_recipient_id", "Send action vs. per-recipient delivery/open/reply"),
                 ("destination_type, recipient_cohort", "1:1 vs. group; new vs. returning, privacy-safe"),
